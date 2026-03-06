@@ -19,19 +19,20 @@ import time
 import json
 import hashlib
 import logging
-import requests
-import pymysql
-import schedule
 import threading
 import queue
 import re
 import random
-from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from collections import Counter
+from datetime import datetime
 
-# Garde tous tes imports mais on met des try/except pour que ça plante pas
+import requests
+import pymysql
+from bs4 import BeautifulSoup
+
+# =============================================================
+# CONFIGURATION DES IMPORTS OPTIONNELS (ML)
+# =============================================================
+ML_AVAILABLE = False
 try:
     import pandas as pd
     import numpy as np
@@ -39,61 +40,50 @@ try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     import joblib
     ML_AVAILABLE = True
-except:
-    ML_AVAILABLE = False
-    print("⚠️ ML modules non disponibles - fonctionnement en mode basique")
+    print("✅ Modules ML chargés avec succès")
+except ImportError as e:
+    print(f"⚠️ Modules ML non disponibles: {e} - fonctionnement en mode basique")
 
 # =============================================================
-# 🧬 CONFIGURATION POUR TIDB CLOUD (TES INFOS)
+# CONFIGURATION POUR TIDB CLOUD (TES INFOS)
 # =============================================================
 
 class BrainConfig:
-    # 🔥 TES INFOS TIDB CLOUD (celles de ton image)
+    """Configuration centralisée du robot"""
+    
+    # 🔥 TES INFOS TIDB CLOUD
     DB_HOST = "gateway01.eu-central-1.prod.aws.tidbcloud.com"
     DB_PORT = 4000
     DB_NAME = "test"
     DB_USER = "3knaJD4GYrbtzop.root"
     DB_PASS = "JObWeGC4nkyYwNor"
     
-    # Yeux (sources de surveillance) - GARDÉES
-    DARKWEB_SOURCES = [
-        # À remplacer par de vraies sources .onion plus tard
-    ]
-    
+    # Sources de surveillance
     PASTEBIN_SOURCES = [
-        "https://pastebin.com/archive",
-        "https://ghostbin.com/pastes",
-        "https://privatebin.net/"
+        "https://pastebin.com/archive"
     ]
     
-    TELEGRAM_CHANNELS = [
-        "@leakdatabase",
-        "@breachalerts",
-        "@darkwebnews"
-    ]
+    DARKWEB_SOURCES = []  # À configurer plus tard avec Tor
     
-    # API Keys (tu pourras les configurer plus tard)
-    TELEGRAM_BOT_TOKEN = "VOTRE_TOKEN"
-    
-    # Configuration des yeux
-    SCAN_INTERVAL_MINUTES = 30  # Plus espacé pour TiDB
-    MAX_THREADS = 5
+    # Configuration des scans
+    SCAN_INTERVAL_MINUTES = 30
     REQUEST_TIMEOUT = 30
+    MAX_EMAILS_PER_BREACH = 20
     
-    # Configuration du cerveau (GARDÉE)
-    AI_MODEL_PATH = "ai_models/breach_detector.pkl"
+    # Configuration IA
     CONFIDENCE_THRESHOLD = 0.7
+    AI_MODEL_PATH = "ai_models/breach_detector.pkl"
     
     # Logging
     LOG_FILE = "darkweb_watcher.log"
     LOG_LEVEL = logging.INFO
 
 # =============================================================
-# 👁️ YEUX DE L'IA (Capteurs multi-sources) - GARDÉ INTACT
+# YEUX DE L'IA (Capteurs multi-sources)
 # =============================================================
 
 class AIEyes:
-    """Yeux de l'IA - Surveillent le web, dark web, forums, réseaux sociaux"""
+    """Surveille Pastebin et autres sources"""
     
     def __init__(self, config):
         self.config = config
@@ -101,12 +91,12 @@ class AIEyes:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-        self.proxy_pool = self._init_proxies()
         self.queue = queue.Queue()
         self.results = []
         self.setup_logging()
         
     def setup_logging(self):
+        """Configure le système de logs"""
         logging.basicConfig(
             level=self.config.LOG_LEVEL,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -117,26 +107,22 @@ class AIEyes:
         )
         self.logger = logging.getLogger("AIEyes")
     
-    def _init_proxies(self):
-        """Initialise un pool de proxies Tor"""
-        proxies = []
-        try:
-            test = requests.get('http://check.torproject.org', proxies={
-                'http': 'socks5h://127.0.0.1:9050',
-                'https': 'socks5h://127.0.0.1:9050'
-            }, timeout=10)
-            if test.status_code == 200:
-                proxies.append({
-                    'http': 'socks5h://127.0.0.1:9050',
-                    'https': 'socks5h://127.0.0.1:9050'
-                })
-                self.logger.info("✅ Tor proxy actif")
-        except:
-            self.logger.warning("⚠️ Tor non disponible")
-        return proxies
+    def _extract_emails(self, text):
+        """Extrait les emails d'un texte"""
+        pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        return re.findall(pattern, text)
+    
+    def _analyze_content(self, text):
+        """Détecte si le contenu contient des mots-clés de fuite"""
+        keywords = [
+            'breach', 'leak', 'dump', 'database', 'password', 
+            'email', 'credit card', 'ssn', 'pwned', 'hack'
+        ]
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in keywords)
     
     def scan_pastebin(self):
-        """Scan Pastebin pour trouver des fuites récentes"""
+        """Scan Pastebin pour trouver des fuites"""
         self.logger.info("🔍 Scan Pastebin en cours...")
         results = []
         
@@ -154,154 +140,84 @@ class AIEyes:
                     paste_id = link['href'][1:]
                     paste_url = f"https://pastebin.com/raw/{paste_id}"
                     
-                    paste_content = self.session.get(paste_url).text
-                    
-                    if self._analyze_content(paste_content):
-                        # Extrait les emails
-                        emails = self._extract_emails(paste_content)
+                    try:
+                        paste_content = self.session.get(paste_url, timeout=10).text
                         
-                        results.append({
-                            'source': 'pastebin',
-                            'url': paste_url,
-                            'content': paste_content[:1000],
-                            'emails': emails[:20],
-                            'timestamp': datetime.now()
-                        })
-                        self.logger.info(f"✅ {len(emails)} emails trouvés: {paste_url}")
+                        if self._analyze_content(paste_content):
+                            emails = self._extract_emails(paste_content)
+                            
+                            if emails:
+                                results.append({
+                                    'source': 'pastebin',
+                                    'url': paste_url,
+                                    'content': paste_content[:500],
+                                    'emails': emails[:self.config.MAX_EMAILS_PER_BREACH],
+                                    'timestamp': datetime.now()
+                                })
+                                self.logger.info(f"✅ {len(emails)} emails trouvés: {paste_url}")
+                                
+                    except Exception as e:
+                        self.logger.debug(f"⚠️ Erreur sur {paste_url}: {e}")
+                        continue
                         
         except Exception as e:
             self.logger.error(f"❌ Erreur scan Pastebin: {e}")
             
         return results
     
-    def _extract_emails(self, text):
-        """Extrait les emails d'un texte"""
-        return re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
-    
-    def scan_darkweb(self):
-        """Scan les sites .onion via Tor"""
-        self.logger.info("🔍 Scan Dark Web en cours...")
-        results = []
-        
-        for source in self.config.DARKWEB_SOURCES:
-            try:
-                response = self.session.get(
-                    source,
-                    proxies=self.proxy_pool[0] if self.proxy_pool else None,
-                    timeout=self.config.REQUEST_TIMEOUT * 2
-                )
-                
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    text = soup.get_text()
-                    
-                    if self._analyze_content(text):
-                        emails = self._extract_emails(text)
-                        results.append({
-                            'source': 'darkweb',
-                            'url': source,
-                            'content': text[:1000],
-                            'emails': emails[:20],
-                            'timestamp': datetime.now()
-                        })
-                        
-            except Exception as e:
-                self.logger.error(f"❌ Erreur scan Dark Web {source}: {e}")
-                
-        return results
-    
-    def _analyze_content(self, text):
-        """Analyse basique du contenu"""
-        keywords = ['breach', 'leak', 'dump', 'database', 'password', 'email', 
-                   'credit card', 'ssn', 'pwned', 'hack', 'compromised']
-        
-        text_lower = text.lower()
-        for keyword in keywords:
-            if keyword in text_lower:
-                return True
-        return False
-    
     def run_continuous_scan(self):
-        """Lance un scan continu de toutes les sources"""
+        """Boucle principale de scan"""
         self.logger.info("🚀 Lancement des scans continus...")
         
         while True:
-            threads = []
-            
-            # Scan Pastebin
-            t1 = threading.Thread(target=lambda: self.queue.put(self.scan_pastebin()))
-            threads.append(t1)
-            
-            # Scan Dark Web (si des sources sont configurées)
-            if self.config.DARKWEB_SOURCES:
-                t2 = threading.Thread(target=lambda: self.queue.put(self.scan_darkweb()))
-                threads.append(t2)
-            
-            for t in threads:
-                t.start()
-            
-            for t in threads:
-                t.join(timeout=self.config.REQUEST_TIMEOUT)
-            
-            while not self.queue.empty():
-                self.results.extend(self.queue.get())
-            
-            time.sleep(self.config.SCAN_INTERVAL_MINUTES * 60)
+            try:
+                results = self.scan_pastebin()
+                if results:
+                    self.results.extend(results)
+                
+                time.sleep(self.config.SCAN_INTERVAL_MINUTES * 60)
+                
+            except Exception as e:
+                self.logger.error(f"❌ Erreur dans la boucle de scan: {e}")
+                time.sleep(60)
 
 # =============================================================
-# 🧠 CERVEAU DE L'IA (Analyse et Machine Learning) - GARDÉ
+# CERVEAU DE L'IA (Analyse)
 # =============================================================
 
 class AIBrain:
-    """Cerveau de l'IA - Analyse, ML, prédictions"""
+    """Analyse les fuites détectées"""
     
     def __init__(self, config):
         self.config = config
-        self.model = None
-        self.memory = []
-        self.neurons = []
-        self.setup_ai()
-        
-    def setup_ai(self):
-        """Initialise le cerveau et charge les modèles"""
         self.logger = logging.getLogger("AIBrain")
+        self.neurons = []
         
-        # Version simplifiée sans ML si pas disponible
         if ML_AVAILABLE:
-            self.vectorizer = TfidfVectorizer(max_features=5000)
-            if os.path.exists(self.config.AI_MODEL_PATH):
-                self.model = joblib.load(self.config.AI_MODEL_PATH)
-                self.logger.info("✅ Modèle IA chargé")
-            else:
-                self.model = RandomForestClassifier(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=42
-                )
-                self.logger.info("🆕 Nouveau modèle IA créé")
-            
             self.neurons = [Neuron() for _ in range(100)]
             self.logger.info(f"🧬 {len(self.neurons)} neurones activés")
     
     def analyze_breach(self, data):
-        """Analyse une fuite potentielle avec l'IA"""
+        """Analyse une fuite et détermine sa sévérité"""
         text = data.get('content', '').lower()
         emails = data.get('emails', [])
         
-        # Analyse basique
+        # Déterminer la sévérité
         severity = 'low'
         if any(word in text for word in ['password', 'pass', 'pwd']):
             severity = 'high'
         if any(word in text for word in ['credit', 'card', 'bank', 'paypal', 'ssn']):
             severity = 'critical'
         
-        # Catégorisation
+        # Catégoriser
         category = 'unknown'
-        for cat, keywords in {
+        categories = {
             'social': ['facebook', 'twitter', 'instagram', 'linkedin'],
             'finance': ['bank', 'paypal', 'credit', 'visa'],
-            'gaming': ['steam', 'origin', 'ubisoft']
-        }.items():
+            'gaming': ['steam', 'origin', 'ubisoft', 'epic']
+        }
+        
+        for cat, keywords in categories.items():
             if any(k in text for k in keywords):
                 category = cat
                 break
@@ -315,18 +231,18 @@ class AIBrain:
         
         return {
             'is_breach': len(emails) > 0,
-            'confidence': min(len(emails) * 5, 100) / 100,
+            'confidence': min(len(emails) * 0.05, 1.0),
             'severity': severity,
             'category': category,
             'data_types': data_types
         }
 
 # =============================================================
-# 🔗 NEURONES ARTIFICIELS (GARDÉS)
+# NEURONES ARTIFICIELS
 # =============================================================
 
 class Neuron:
-    """Neurone artificiel pour l'apprentissage profond"""
+    """Neurone artificiel simple pour l'apprentissage"""
     
     def __init__(self):
         self.weights = [random.random() for _ in range(5)]
@@ -334,15 +250,16 @@ class Neuron:
         self.fired_count = 0
         
     def fire(self, inputs):
-        """Activation du neurone"""
+        """Active le neurone"""
         if len(inputs) > len(self.weights):
             inputs = inputs[:len(self.weights)]
+        
         activation = sum(w * i for w, i in zip(self.weights, inputs)) + self.bias
         self.fired_count += 1
         return max(0, activation)
 
 # =============================================================
-# 🗄️ CONNECTEUR TIDB CLOUD (ADAPTÉ)
+# CONNECTEUR TIDB CLOUD
 # =============================================================
 
 class DatabaseConnector:
@@ -368,9 +285,14 @@ class DatabaseConnector:
             logging.info("✅ Connecté à TiDB Cloud")
         except Exception as e:
             logging.error(f"❌ Erreur connexion DB: {e}")
+            raise  # Important: remonte l'erreur pour que Render la voie
     
     def save_breach(self, result, analysis):
         """Sauvegarde une fuite dans TiDB Cloud"""
+        if not self.connection:
+            logging.error("❌ Pas de connexion à la base")
+            return None
+            
         try:
             with self.connection.cursor() as cursor:
                 # 1. Insérer dans breaches
@@ -396,17 +318,18 @@ class DatabaseConnector:
                 
                 breach_id = cursor.lastrowid
                 
-                # 2. Insérer les emails dans compromised_emails
-                for email in result.get('emails', [])[:20]:
+                # 2. Insérer les emails
+                sql_email = """
+                    INSERT INTO compromised_emails (
+                        email_hash, email_domain, breach_id, 
+                        exposed_data, first_seen
+                    ) VALUES (%s, %s, %s, %s, %s)
+                """
+                
+                for email in result.get('emails', []):
                     email_hash = hashlib.sha256(email.lower().encode()).hexdigest()
                     domain = email.split('@')[-1] if '@' in email else ''
                     
-                    sql_email = """
-                        INSERT INTO compromised_emails (
-                            email_hash, email_domain, breach_id, 
-                            exposed_data, first_seen
-                        ) VALUES (%s, %s, %s, %s, %s)
-                    """
                     cursor.execute(sql_email, (
                         email_hash,
                         domain,
@@ -426,7 +349,7 @@ class DatabaseConnector:
             return None
 
 # =============================================================
-# 📢 NOTIFICATEUR (SIMPLIFIÉ MAIS GARDÉ)
+# NOTIFICATEUR
 # =============================================================
 
 class Notifier:
@@ -436,16 +359,16 @@ class Notifier:
         self.config = config
     
     def send_alerts(self, result, analysis):
-        """Log les alertes (version simplifiée)"""
+        """Log les alertes importantes"""
         if analysis['severity'] in ['critical', 'high']:
             logging.warning(f"🚨 ALERTE {analysis['severity'].upper()}: Fuite détectée sur {result['source']}")
 
 # =============================================================
-# 🤖 ROBOT PRINCIPAL
+# ROBOT PRINCIPAL
 # =============================================================
 
 class DarkWebWatcherAI:
-    """Robot principal avec yeux, cerveau et neurones"""
+    """Robot principal"""
     
     def __init__(self):
         self.config = BrainConfig()
@@ -454,6 +377,7 @@ class DarkWebWatcherAI:
         self.db = DatabaseConnector(self.config)
         self.notifier = Notifier(self.config)
         self.logger = logging.getLogger("DarkWebWatcherAI")
+        self.running = True
         
     def run(self):
         """Lance le robot"""
@@ -462,18 +386,20 @@ class DarkWebWatcherAI:
 ║     🚀 DARK WEB WATCHER - CONNECTÉ À TIDB CLOUD              ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  ✅ Base: TiDB Cloud (EN LIGNE)                               ║
-║  ✅ Yeux: ACTIVÉS                                              ║
+║  ✅ Yeux: ACTIVÉS (Pastebin)                                  ║
 ║  🧠 Cerveau: ACTIVÉ                                            ║
 ║  🔗 Neurones: PRÊTS                                            ║
 ╚════════════════════════════════════════════════════════════════╝
         """)
         
+        # Lance le scan dans un thread séparé
         scan_thread = threading.Thread(target=self.eyes.run_continuous_scan)
         scan_thread.daemon = True
         scan_thread.start()
         
-        while True:
-            try:
+        # Boucle principale de traitement
+        try:
+            while self.running:
                 if self.eyes.results:
                     for result in self.eyes.results:
                         self.logger.info(f"📊 Analyse de {result['source']}...")
@@ -483,23 +409,31 @@ class DarkWebWatcherAI:
                             self.db.save_breach(result, analysis)
                             self.notifier.send_alerts(result, analysis)
                             
-                            # Apprentissage (neurones)
+                            # Active un neurone aléatoire (apprentissage)
                             if self.brain.neurons:
-                                self.brain.neurons[random.randint(0, len(self.brain.neurons)-1)].fire([analysis['confidence']])
+                                neuron = random.choice(self.brain.neurons)
+                                neuron.fire([analysis['confidence']])
                     
                     self.eyes.results = []
                 
                 time.sleep(10)
                 
-            except KeyboardInterrupt:
-                self.logger.info("👋 Arrêt...")
-                sys.exit(0)
-            except Exception as e:
-                self.logger.error(f"❌ Erreur: {e}")
-                time.sleep(60)
+        except KeyboardInterrupt:
+            self.logger.info("👋 Arrêt demandé...")
+        except Exception as e:
+            self.logger.error(f"❌ Erreur fatale: {e}")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Nettoie les ressources avant de quitter"""
+        self.logger.info("🧹 Nettoyage des ressources...")
+        if self.db.connection:
+            self.db.connection.close()
+        self.logger.info("✅ Robot arrêté proprement")
 
 # =============================================================
-# 🚀 DÉMARRAGE
+# POINT D'ENTRÉE PRINCIPAL
 # =============================================================
 
 if __name__ == "__main__":
